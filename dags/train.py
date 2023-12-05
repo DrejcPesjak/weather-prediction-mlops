@@ -16,15 +16,11 @@ BUCKET_NAME = 'europe-central2-rso-ml-airf-05c3abe0-bucket'
 DATASET_ID = 'weather_prediction'
 WEATHER_TABLE_ID = 'weather_history_LJ'
 PREDICT_TABLE_ID = 'weather_predictions'
-MODEL_NAME = 'dnn_multitarget'
-TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-MODEL_PATH = f"gs://{BUCKET_NAME}/models/{MODEL_NAME}_{TIMESTAMP}.h5"
 
 default_args = {
-    'dag_id': 'weather_prediction_training',
     'owner': 'user',
     'start_date': datetime.datetime(2023, 1, 1),
-    'email': ['your-email@example.com'],
+    'email': ['drejcpesjak.pesjak@gmail.com'],
     'email_on_failure': False,
     'email_on_retry': False,
     'retries': 1,
@@ -38,12 +34,22 @@ default_args = {
     catchup=False
 )
 def weather_prediction_training():
+
+    @task
+    def set_model_id_name():
+        name = 'dnn_multitarget'
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        model_id_name = f"{name}_{timestamp}"
+        # MODEL_PATH = f"gs://{BUCKET_NAME}/models/{model_id_name}.h5"
+        return model_id_name
+
     @task
     def fetch_weather_data():
         client = bigquery.Client(project=PROJECT_ID)
         query = f"""
             SELECT * 
             FROM `{PROJECT_ID}.{DATASET_ID}.{WEATHER_TABLE_ID}`
+            ORDER BY time
         """
         query_job = client.query(query)
         df = query_job.to_dataframe()
@@ -53,19 +59,28 @@ def weather_prediction_training():
     def split_data(df: pd.DataFrame):
         # Assuming preprocessing in ETL pipeline
 
+        # set time as index
+        df = df.set_index('time')
+
         # Split the data, last 10 rows as test set
         test_size = 10
         X_train, X_test = df.iloc[:-test_size], df.iloc[-test_size:]
         y_train = X_train[['temperature_2m_mean____C_', 'precipitation_sum__mm_']]
         y_test = X_test[['temperature_2m_mean____C_', 'precipitation_sum__mm_']]
+
+        # convert to float32
+        X_train = X_train.astype('float32')
+        X_test = X_test.astype('float32')
+        y_train = y_train.astype('float32')
+        y_test = y_test.astype('float32')
         
         return {'X_train': X_train, 'X_test': X_test, 'y_train': y_train, 'y_test': y_test}
 
     @task
-    def train_model(split):
+    def train_model(split, model_id_name):
         X_train, y_train = split['X_train'], split['y_train']
         # set time as index
-        X_train = X_train.set_index('time')
+        # X_train = X_train.set_index('time')
 
         # Set seed for reproducibility
         np.random.seed(0)
@@ -120,36 +135,71 @@ def weather_prediction_training():
             callbacks=[early_stopping]
         )
 
-        return model
+        # save model
+        # model.save("model.h5") # save model to local storage
+        # model.save(MODEL_PATH) # save model to GCS
+        local_path = save_model_to_gcs(model, model_id_name)
+        return local_path
+    
+    def save_model_to_gcs(model, model_id_name):
+        local_path = './tmp/' + model_id_name + '.h5'
+        model.save(local_path)
 
+        # Upload the model to GCS
+        from google.cloud import storage
+        gcs_path = 'models/' + model_id_name + '.h5'
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BUCKET_NAME)
+        blob = bucket.blob(gcs_path)
+        blob.upload_from_filename(local_path)
+        return local_path
 
     @task
-    def save_model_to_gcs(model):
-        model.save(MODEL_PATH)
+    def predict_and_store(model_path, split, model_id_name):
+        X_train, y_train = split['X_train'], split['y_train']
+        X_test, y_test = split['X_test'], split['y_test']
 
-    @task
-    def predict_and_store(model, split, project_id, dataset_id, table_id, model_id_name):
-        X_test, y_test = ['X_test'], split['y_test']
-        # set time as index
-        X_test = X_test.set_index('time')
+        # get 1 month of data
+        len_test = len(X_test)
+        if len_test > 30:
+            X_test = X_test[-30:]
+            y_test = y_test[-30:]
+        else:
+            # also take some from train
+            X_test = pd.concat([X_train[-(30-len_test):], X_test])
+            y_test = pd.concat([y_train[-(30-len_test):], y_test])
+
+
+        # Load the model
+        model = keras.models.load_model(model_path)
         
         # Generate predictions
         predictions = model.predict(X_test)
 
+        # Reshape or slice the predictions to make them 2-dimensional
+        temp_predictions = predictions[0].flatten()  # Flatten the temperature predictions
+        precip_predictions = predictions[1].flatten()  # Flatten the precipitation predictions
+
         # Create a DataFrame for the predictions
-        predictions_df = pd.DataFrame(predictions, columns=['temp_predict', 'precip_predict'])
+        predictions_df = pd.DataFrame({
+            'temp_predict': temp_predictions,
+            'precip_predict': precip_predictions
+        })
+
         # Reset index of y_test to get the date column
         y_test.reset_index(inplace=True)
+
         # Combine the date and predictions
         predictions_df['weather_date'] = y_test['time']
         predictions_df['model_id_name'] = model_id_name
+
         # Reorder columns to match BigQuery table schema
         predictions_df = predictions_df[['model_id_name', 'weather_date', 'temp_predict', 'precip_predict']]
-
+        
         # Create a BigQuery client
-        client = bigquery.Client(project=project_id)
+        client = bigquery.Client(project=PROJECT_ID)
         # Define the table to which to write
-        table_ref = f"{project_id}.{dataset_id}.{table_id}"
+        table_ref = f"{PROJECT_ID}.{DATASET_ID}.{PREDICT_TABLE_ID}"
         # Define job configuration
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
         # Write the DataFrame to BigQuery
@@ -158,21 +208,17 @@ def weather_prediction_training():
     trigger_eval_dag = TriggerDagRunOperator(
         task_id="trigger_eval_dag",
         trigger_dag_id="eval_dag", 
-        conf={'model_id_name': MODEL_NAME + '_' + TIMESTAMP},
+        conf={'model_id_name': '{{ task_instance.xcom_pull(task_ids="set_model_id_name") }}'},
     )
 
-    # Define DAG flow
+    model_id_name = set_model_id_name()
     data = fetch_weather_data()
     split_output = split_data(data)
-    model = train_model(split_output)
-    save_model_to_gcs(model)
+    model_path = train_model(split_output, model_id_name)
     predict_and_store(
-        model, 
-        split_output,
-        PROJECT_ID, 
-        DATASET_ID, 
-        PREDICT_TABLE_ID, 
-        MODEL_NAME + '_' + TIMESTAMP
+        model_path, 
+        split_output, 
+        model_id_name
     ) >> trigger_eval_dag
 
 weather_prediction_training_dag = weather_prediction_training()
