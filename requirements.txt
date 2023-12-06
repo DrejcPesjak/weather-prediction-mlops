@@ -1,0 +1,9 @@
+apache-airflow
+seaborn
+matplotlib
+tensorflow
+scikit-learn
+numpy
+pandas
+google-cloud-bigquery
+google-cloud-storage
