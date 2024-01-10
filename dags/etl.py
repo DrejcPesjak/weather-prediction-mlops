@@ -92,6 +92,9 @@ def preprocess_data(df_orig):
     # Since we shifted y, we need to drop the last row of df to align it with y
     df = df.iloc[:-1]
 
+    # missing wind gust
+    df.insert(loc=13, column='wind_gusts_10m_max (km/h)', value=df['wind_speed_10m_max (km/h)'])
+
     return df, y
 
 default_args = {

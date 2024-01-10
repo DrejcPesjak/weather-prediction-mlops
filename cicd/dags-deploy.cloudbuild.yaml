@@ -1,0 +1,10 @@
+steps:
+  # install dependencies
+  - name: python
+    entrypoint: pip
+    args: ["install", "-r", "requirements.txt", "--user"]
+
+  # run
+  - name: python
+    entrypoint: python
+    args: ["cicd/dags-deploy.py", "--dags_directory=${_DAGS_DIRECTORY}", "--dags_bucket=${_DAGS_BUCKET}"]
