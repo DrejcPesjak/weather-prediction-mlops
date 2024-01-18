@@ -77,4 +77,20 @@ To set up Apache Airflow for this project, follow these steps:
    sudo fuser -k 8081/tcp
    ```
 
+9. **Important:** Before running the DAGs, set the necessary Airflow variables via the Airflow Web UI. Specifically, add the following variable:
+
+   ```json
+   gcp_info = {
+       "project_id": "balmy-apogee-404909",
+       "bucket_name": "europe-central2-rso-ml-airf-05c3abe0-bucket",
+       "dataset_id": "weather_prediction",
+       "weather_table_id": "weather_history_LJ",
+       "predict_table_id": "weather_predictions",
+       "model_table_id": "weather_models"
+   }
+   ```
+
+   This variable is essential for the correct functioning of the DAGs, as it provides necessary configuration information.
+
+
 Now, you should have Apache Airflow set up and running for your project.

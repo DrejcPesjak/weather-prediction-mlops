@@ -1,5 +1,6 @@
 import datetime
 from airflow.decorators import dag, task
+from airflow.models import Variable
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 # from airflow.providers.google.cloud.transfers.bigquery_to_gcs import BigQueryToGCSOperator
 # from airflow.providers.google.cloud.sensors.gcs import GCSObjectsWithPrefixExistenceSensor
@@ -9,13 +10,6 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, regularizers, callbacks
 from google.cloud import bigquery
-
-# Constants and configurations
-PROJECT_ID = 'balmy-apogee-404909'
-BUCKET_NAME = 'europe-central2-rso-ml-airf-05c3abe0-bucket'
-DATASET_ID = 'weather_prediction'
-WEATHER_TABLE_ID = 'weather_history_LJ'
-PREDICT_TABLE_ID = 'weather_predictions'
 
 default_args = {
     'owner': 'user',
@@ -44,7 +38,11 @@ def weather_prediction_training():
         return model_id_name
 
     @task
-    def fetch_weather_data():
+    def fetch_weather_data(gcp_info):
+        PROJECT_ID = gcp_info['project_id']
+        DATASET_ID = gcp_info['dataset_id']
+        WEATHER_TABLE_ID = gcp_info['weather_table_id']
+
         client = bigquery.Client(project=PROJECT_ID)
         query = f"""
             SELECT * 
@@ -77,7 +75,7 @@ def weather_prediction_training():
         return {'X_train': X_train, 'X_test': X_test, 'y_train': y_train, 'y_test': y_test}
 
     @task
-    def train_model(split, model_id_name):
+    def train_model(split, model_id_name, gcp_info):
         X_train, y_train = split['X_train'], split['y_train']
         # set time as index
         # X_train = X_train.set_index('time')
@@ -138,10 +136,11 @@ def weather_prediction_training():
         # save model
         # model.save("model.h5") # save model to local storage
         # model.save(MODEL_PATH) # save model to GCS
-        local_path = save_model_to_gcs(model, model_id_name)
+        local_path = save_model_to_gcs(model, model_id_name, gcp_info)
         return local_path
     
-    def save_model_to_gcs(model, model_id_name):
+    def save_model_to_gcs(model, model_id_name, gcp_info):
+        BUCKET_NAME = gcp_info['bucket_name']
         local_path = './tmp/' + model_id_name + '.h5'
         model.save(local_path)
 
@@ -155,7 +154,7 @@ def weather_prediction_training():
         return local_path
 
     @task
-    def predict_and_store(model_path, split, model_id_name):
+    def predict_and_store(model_path, split, model_id_name, gcp_info):
         X_train, y_train = split['X_train'], split['y_train']
         X_test, y_test = split['X_test'], split['y_test']
 
@@ -195,6 +194,11 @@ def weather_prediction_training():
 
         # Reorder columns to match BigQuery table schema
         predictions_df = predictions_df[['model_id_name', 'weather_date', 'temp_predict', 'precip_predict']]
+
+        # Get GCP info from Airflow variables
+        PROJECT_ID = gcp_info['project_id']
+        DATASET_ID = gcp_info['dataset_id']
+        PREDICT_TABLE_ID = gcp_info['predict_table_id']
         
         # Create a BigQuery client
         client = bigquery.Client(project=PROJECT_ID)
@@ -211,14 +215,27 @@ def weather_prediction_training():
         conf={'model_id_name': '{{ task_instance.xcom_pull(task_ids="set_model_id_name") }}'},
     )
 
+    # Get GCP info from Airflow variables
+    # gcp_info = {
+    #     "project_id": "balmy-apogee-404909",
+    #     "bucket_name": "europe-central2-rso-ml-airf-05c3abe0-bucket",
+    #     "dataset_id": "weather_prediction",
+    #     "weather_table_id": "weather_history_LJ",
+    #     "predict_table_id": "weather_predictions",
+    #     "model_table_id": "weather_models"
+    # }
+    gcp_info = Variable.get('gcp_info', deserialize_json=True)
+
+    # Define the DAG flow
     model_id_name = set_model_id_name()
-    data = fetch_weather_data()
+    data = fetch_weather_data(gcp_info)
     split_output = split_data(data)
-    model_path = train_model(split_output, model_id_name)
+    model_path = train_model(split_output, model_id_name, gcp_info)
     predict_and_store(
         model_path, 
         split_output, 
-        model_id_name
+        model_id_name,
+        gcp_info
     ) >> trigger_eval_dag
 
 weather_prediction_training_dag = weather_prediction_training()

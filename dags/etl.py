@@ -1,6 +1,7 @@
 import datetime
 from airflow.decorators import dag, task
 from airflow.utils.dates import days_ago
+from airflow.models import Variable
 import requests
 from io import StringIO
 import pandas as pd
@@ -93,7 +94,8 @@ def preprocess_data(df_orig):
     df = df.iloc[:-1]
 
     # missing wind gust
-    df.insert(loc=13, column='wind_gusts_10m_max (km/h)', value=df['wind_speed_10m_max (km/h)'])
+    if 'wind_gusts_10m_max (km/h)' not in df.columns:
+        df.insert(loc=13, column='wind_gusts_10m_max (km/h)', value=df['wind_speed_10m_max (km/h)'])
 
     return df, y
 
@@ -117,10 +119,10 @@ default_args = {
 )
 def open_meteo_download():
     @task
-    def extract(lat, lon, bigquery_info):
-        project_id = bigquery_info['project_id']
-        dataset_id = bigquery_info['dataset_id']
-        table_id = bigquery_info['table_id']
+    def extract(lat, lon, gcp_info):
+        project_id = gcp_info['project_id']
+        dataset_id = gcp_info['dataset_id']
+        table_id = gcp_info['weather_table_id']
 
         # Set up BigQuery client
         client = bigquery.Client(project=project_id)
@@ -153,10 +155,10 @@ def open_meteo_download():
         return proc_df
 
     @task()
-    def load(proc_df, bigquery_info):
-        project_id = bigquery_info['project_id']
-        dataset_id = bigquery_info['dataset_id']
-        table_id = bigquery_info['table_id']
+    def load(proc_df, gcp_info):
+        project_id = gcp_info['project_id']
+        dataset_id = gcp_info['dataset_id']
+        table_id = gcp_info['weather_table_id']
 
         # Set up BigQuery client
         client = bigquery.Client(project=project_id)
@@ -177,14 +179,20 @@ def open_meteo_download():
         print(f'BigQuery load job {job.job_id} is complete, with state: {job.state}')
         print(f'Loaded {job.output_rows} rows to {project_id}.{dataset_id}.{table_id}')
 
+    # Get GCP info from Airflow variables
+    # gcp_info = {
+    #     "project_id": "balmy-apogee-404909",
+    #     "bucket_name": "europe-central2-rso-ml-airf-05c3abe0-bucket",
+    #     "dataset_id": "weather_prediction",
+    #     "weather_table_id": "weather_history_LJ",
+    #     "predict_table_id": "weather_predictions",
+    #     "model_table_id": "weather_models"
+    # }
+    gcp_info = Variable.get('gcp_info', deserialize_json=True)
+
     # Define the DAG flow
-    bigquery_info = {
-        'project_id': 'balmy-apogee-404909',
-        'dataset_id': 'weather_prediction',
-        'table_id': 'weather_history_LJ'
-    }
-    extract_ouput = extract(46.0511, 14.5051, bigquery_info)
+    extract_ouput = extract(46.0511, 14.5051, gcp_info)
     processed_data = transform(extract_ouput)
-    load(processed_data, bigquery_info)
+    load(processed_data, gcp_info)
 
 open_meteo_download_dag = open_meteo_download()

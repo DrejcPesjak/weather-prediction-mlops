@@ -1,19 +1,11 @@
 import datetime
 from airflow.decorators import dag, task
+from airflow.models import Variable
 from google.cloud import bigquery
 from google.cloud import storage
 import pandas as pd
 import numpy as np
 from sklearn.metrics import mean_squared_error
-
-# Constants and configurations
-PROJECT_ID = 'balmy-apogee-404909'
-BUCKET_NAME = 'europe-central2-rso-ml-airf-05c3abe0-bucket'
-DATASET_ID = 'weather_prediction'
-WEATHER_TABLE_ID = 'weather_history_LJ'
-PREDICT_TABLE_ID = 'weather_predictions'
-MODEL_TABLE_ID = 'weather_models'
-PROXY_FILE_NAME = 'proxy_model.best'
 
 default_args = {
     'owner': 'user',
@@ -33,8 +25,15 @@ default_args = {
 )
 def eval_dag():
     @task
-    def calc_rmse(model_id_name):
+    def calc_rmse(model_id_name, gcp_info):
         print(model_id_name)
+
+        PROJECT_ID = gcp_info['project_id']
+        DATASET_ID = gcp_info['dataset_id']
+        WEATHER_TABLE_ID = gcp_info['weather_table_id']
+        PREDICT_TABLE_ID = gcp_info['predict_table_id']
+        MODEL_TABLE_ID = gcp_info['model_table_id']
+
         client = bigquery.Client(project=PROJECT_ID)
 
         # Query to fetch the last month of weather data
@@ -91,7 +90,11 @@ def eval_dag():
         return rmse
 
     @task
-    def get_best(current_model_id, rmse_new):
+    def get_best(current_model_id, rmse_new, gcp_info):
+        PROJECT_ID = gcp_info['project_id']
+        DATASET_ID = gcp_info['dataset_id']
+        MODEL_TABLE_ID = gcp_info['model_table_id']
+
         client = bigquery.Client(project=PROJECT_ID)
         query = f"""
             SELECT model_id_name
@@ -105,7 +108,8 @@ def eval_dag():
         return best_model_id_name
 
     @task
-    def update_proxy(best_model_id_name):
+    def update_proxy(best_model_id_name, gcp_info):
+        BUCKET_NAME = gcp_info['bucket_name']
         storage_client = storage.Client()
         bucket = storage_client.bucket(BUCKET_NAME)
 
@@ -120,10 +124,23 @@ def eval_dag():
                 bucket.rename_blob(blob, new_proxy_file_name)
                 break
 
+    # Get GCP info from Airflow variables
+    # gcp_info = {
+    #     "project_id": "balmy-apogee-404909",
+    #     "bucket_name": "europe-central2-rso-ml-airf-05c3abe0-bucket",
+    #     "dataset_id": "weather_prediction",
+    #     "weather_table_id": "weather_history_LJ",
+    #     "predict_table_id": "weather_predictions",
+    #     "model_table_id": "weather_models"
+    # }
+    gcp_info = Variable.get('gcp_info', deserialize_json=True)
+    
     model_id_name = '{{ dag_run.conf["model_id_name"] }}'
     # model_id_name = "dnn_multitarget_20231205-184325"
-    rmse = calc_rmse(model_id_name)
-    best_model_id_name = get_best(model_id_name, rmse)
-    update_proxy(best_model_id_name)
+
+    # Define the DAG flow
+    rmse = calc_rmse(model_id_name, gcp_info)
+    best_model_id_name = get_best(model_id_name, rmse, gcp_info)
+    update_proxy(best_model_id_name, gcp_info)
 
 eval_dag_instance = eval_dag()
